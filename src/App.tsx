@@ -1,11 +1,17 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { FormEvent, ReactNode } from 'react';
+import { Capacitor } from '@capacitor/core';
+import { Camera, CameraResultType, CameraSource } from '@capacitor/camera';
+import { PushNotifications } from '@capacitor/push-notifications';
 import {
   Bell,
   BriefcaseBusiness,
   CalendarDays,
   CheckCircle2,
   ChevronRight,
+  Camera as CameraIcon,
+  CreditCard,
+  FileText,
   Home,
   LogOut,
   PackageSearch,
@@ -148,6 +154,71 @@ type Settlement = {
   createdAt: string;
 };
 
+type TechnicianJob = {
+  id: string;
+  orderNo: string;
+  orderStatus: string;
+  paymentStatus: string;
+  assignedTechnicianId: string | null;
+  customerName: string;
+  customerPhone: string;
+  addressSummary: string;
+  productName: string;
+  scheduleType: string;
+  serviceType: string;
+  airconType: string;
+  basePrice: number;
+  productTotalPrice: number;
+  extraTotalPrice: number;
+  totalPrice: number;
+  customerMemo?: string | null;
+  adminMemo?: string | null;
+};
+
+type OrderPhoto = {
+  id: string;
+  orderId: string;
+  technicianId: string | null;
+  kind: 'before_work' | 'after_work' | 'other';
+  url: string;
+  caption: string | null;
+  createdAt: string;
+};
+
+type ServiceAddon = {
+  id: string;
+  name: string;
+  code: string;
+  unit: string;
+  customerPrice: number | null;
+  description?: string | null;
+};
+
+type ExtraQuoteItem = {
+  id: string;
+  quoteId: string;
+  addonId: string | null;
+  materialId: string | null;
+  name: string;
+  quantity: number;
+  unit: string;
+  unitPrice: number;
+  amount: number;
+};
+
+type ExtraQuote = {
+  id: string;
+  orderId: string;
+  technicianId: string | null;
+  status: 'requested' | 'approved' | 'paid' | 'rejected' | 'cancelled';
+  totalAmount: number;
+  customerApprovedAt: string | null;
+  paidAt: string | null;
+  memo: string | null;
+  createdAt: string;
+  items: ExtraQuoteItem[];
+};
+
 type ReviewSummary = {
   averageRating: number | null;
   reviewCount: number;
@@ -170,12 +241,33 @@ function isReadOnlySession(session: PartnerSession): boolean {
   return session.preview === true || session.role !== 'technician';
 }
 
-function apiUrl(path: string): string {
-  const raw = String(import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:4000').trim();
+/** 배포된 Nest API origin만 (끝 / 와 /api 제거). 로컬 dev 에서만 기본값 사용 — Vite 빌드에 미설정 시 127.0.0.1 으로 가면 사용자 PC 로만 요청되어 로그인 불가 */
+function apiOrigin(): string {
+  const raw = String(import.meta.env.VITE_API_BASE_URL ?? '').trim();
   const origin = raw.replace(/\/$/, '').replace(/\/api\/?$/i, '');
-  const normalizedPath = path.startsWith('/api') ? path : `/api${path.startsWith('/') ? path : `/${path}`}`;
+  if (origin.length > 0) return origin;
+  if (import.meta.env.DEV) return 'http://127.0.0.1:4000';
+  return '';
+}
+
+function apiPath(path: string): string {
+  return path.startsWith('/api') ? path : `/api${path.startsWith('/') ? path : `/${path}`}`;
+}
+
+function apiUrl(path: string): string {
+  const origin = apiOrigin();
+  const normalizedPath = apiPath(path);
+  if (!origin) {
+    if (typeof window !== 'undefined') {
+      return `${window.location.origin}${normalizedPath}`;
+    }
+    return normalizedPath;
+  }
   return `${origin}${normalizedPath}`;
 }
+
+const PROD_MISSING_API_URL =
+  import.meta.env.PROD && !String(import.meta.env.VITE_API_BASE_URL ?? '').trim();
 
 function readSession(): PartnerSession | null {
   try {
@@ -232,18 +324,39 @@ async function readEnvelope<T>(res: Response): Promise<T> {
 }
 
 async function publicApi<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(apiUrl(path), {
-    credentials: 'omit',
-    ...init,
-    headers: {
-      'Content-Type': 'application/json',
-      ...(init?.headers || {}),
-    },
-  });
+  if (PROD_MISSING_API_URL) {
+    throw new Error(
+      '배포 설정 오류: Vercel(또는 빌드 환경)에 VITE_API_BASE_URL 이 없습니다. Nest API 주소(https://…)를 넣고 재배포하세요.',
+    );
+  }
+  let res: Response;
+  try {
+    res = await fetch(apiUrl(path), {
+      credentials: 'omit',
+      ...init,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(init?.headers || {}),
+      },
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg.includes('Failed to fetch') || msg.includes('Load failed') || msg.includes('NetworkError')) {
+      throw new Error(
+        '서버에 연결하지 못했습니다. VITE_API_BASE_URL(Nest 주소)과 API 서버 CORS_ORIGIN(이 웹앱 https 주소)을 확인하세요.',
+      );
+    }
+    throw e;
+  }
   return readEnvelope<T>(res);
 }
 
 async function partnerApi<T>(session: PartnerSession, path: string, init?: RequestInit): Promise<T> {
+  if (PROD_MISSING_API_URL) {
+    throw new Error(
+      '배포 설정 오류: VITE_API_BASE_URL 이 없습니다. Vercel 환경 변수를 설정한 뒤 재배포하세요.',
+    );
+  }
   const res = await fetch(apiUrl(path), {
     credentials: 'omit',
     ...init,
@@ -252,6 +365,21 @@ async function partnerApi<T>(session: PartnerSession, path: string, init?: Reque
       'x-technician-id': session.technicianId,
       ...(init?.headers || {}),
     },
+  });
+  return readEnvelope<T>(res);
+}
+
+async function partnerFormApi<T>(session: PartnerSession, path: string, form: FormData): Promise<T> {
+  if (PROD_MISSING_API_URL) {
+    throw new Error('배포 설정 오류: VITE_API_BASE_URL 이 없습니다. Vercel 환경 변수를 설정한 뒤 재배포하세요.');
+  }
+  const res = await fetch(apiUrl(path), {
+    method: 'POST',
+    credentials: 'omit',
+    headers: {
+      'x-technician-id': session.technicianId,
+    },
+    body: form,
   });
   return readEnvelope<T>(res);
 }
@@ -269,6 +397,26 @@ async function adminApi<T>(role: AdminRole, path: string, init?: RequestInit): P
 function won(value: number | null | undefined): string {
   if (value == null || !Number.isFinite(Number(value))) return '-';
   return `${Math.round(Number(value)).toLocaleString('ko-KR')}원`;
+}
+
+async function registerNativePush(session: PartnerSession): Promise<void> {
+  if (isReadOnlySession(session)) return;
+  if (!Capacitor.isNativePlatform()) return;
+  const permission = await PushNotifications.requestPermissions();
+  if (permission.receive !== 'granted') return;
+  await PushNotifications.addListener('registration', (token) => {
+    void partnerApi(session, '/technician/notifications/devices', {
+      method: 'POST',
+      body: JSON.stringify({
+        channel: 'fcm',
+        token: token.value,
+        platform: Capacitor.getPlatform(),
+        deviceLabel: 'ACNow 파트너 앱',
+      }),
+    }).catch(() => undefined);
+  });
+  await PushNotifications.addListener('registrationError', () => undefined);
+  await PushNotifications.register();
 }
 
 function statusLabel(status: string): string {
@@ -379,6 +527,27 @@ function LoginScreen({ onSignedIn }: { onSignedIn: (session: PartnerSession) => 
 
   return (
     <main className="login-page">
+      {PROD_MISSING_API_URL ? (
+        <div
+          className="form-message"
+          style={{
+            margin: '0 auto 1rem',
+            maxWidth: 420,
+            padding: '0.75rem 1rem',
+            borderRadius: 12,
+            background: 'rgba(220,38,38,0.12)',
+            color: '#7f1d1d',
+            fontSize: 13,
+            lineHeight: 1.5,
+          }}
+          role="alert"
+        >
+          <strong>배포 설정 필요:</strong> Vercel 프로젝트 → Settings → Environment Variables 에{' '}
+          <code style={{ wordBreak: 'break-all' }}>VITE_API_BASE_URL</code> = 귀하의 Nest API origin(예:{' '}
+          <code>https://api.example.com</code>, 끝에 <code>/api</code> 붙이지 않음)을 추가한 뒤 <strong>Redeploy</strong>
+          하세요.
+        </div>
+      ) : null}
       <section className="login-hero">
         <img src="/branding/icon-mark.png" alt="ACNow" className="login-logo" />
         <p className="eyebrow">ACNow 파트너</p>
@@ -422,6 +591,7 @@ function PartnerApp({ session, onLogout }: { session: PartnerSession; onLogout: 
   const [home, setHome] = useState<PartnerHome | null>(null);
   const [homeError, setHomeError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
 
   const loadHome = useCallback(async () => {
     setRefreshing(true);
@@ -440,6 +610,10 @@ function PartnerApp({ session, onLogout }: { session: PartnerSession; onLogout: 
     const id = window.setInterval(loadHome, POLL_MS);
     return () => window.clearInterval(id);
   }, [loadHome]);
+
+  useEffect(() => {
+    void registerNativePush(session).catch(() => undefined);
+  }, [session]);
 
   const title = {
     home: '홈',
@@ -475,12 +649,21 @@ function PartnerApp({ session, onLogout }: { session: PartnerSession; onLogout: 
           </div>
         ) : null}
         {homeError ? <NoticeTone tone="danger">{homeError}</NoticeTone> : null}
-        {tab === 'home' ? <HomeTab session={session} home={home} onReload={loadHome} /> : null}
+        {tab === 'home' ? <HomeTab session={session} home={home} onReload={loadHome} onOpenJob={setSelectedJobId} /> : null}
         {tab === 'dispatch' ? <DispatchTab session={session} /> : null}
         {tab === 'reservation' ? <ReservationTab session={session} /> : null}
         {tab === 'materials' ? <MaterialsTab session={session} /> : null}
         {tab === 'my' ? <MyTab session={session} home={home} onLogout={onLogout} /> : null}
       </main>
+
+      {selectedJobId ? (
+        <JobDetailSheet
+          session={session}
+          orderId={selectedJobId}
+          onClose={() => setSelectedJobId(null)}
+          onChanged={loadHome}
+        />
+      ) : null}
 
       <nav className="tabbar">
         <TabButton active={tab === 'home'} icon={<Home size={19} />} label="홈" onClick={() => setTab('home')} />
@@ -531,10 +714,12 @@ function HomeTab({
   session,
   home,
   onReload,
+  onOpenJob,
 }: {
   session: PartnerSession;
   home: PartnerHome | null;
   onReload: () => void;
+  onOpenJob: (orderId: string) => void;
 }) {
   const workStatus = home?.technician.workStatus ?? session.workStatus ?? 'offline';
   const [busy, setBusy] = useState(false);
@@ -595,12 +780,12 @@ function HomeTab({
           <EmptyState title="오늘 확정된 작업이 없습니다" body="배차와 예약 탭에서 받을 수 있는 콜을 확인하세요." />
         ) : (
           home!.todayJobs.map((job) => (
-            <article className="list-card" key={job.id}>
+            <article className="list-card clickable" key={job.id} onClick={() => onOpenJob(job.id)}>
               <div>
                 <strong>{job.productName}</strong>
                 <p>{job.regionLabel} · {job.scheduleText}</p>
               </div>
-              <span>{won(job.expectedPayout)}</span>
+              <span>{won(job.expectedPayout)} <ChevronRight size={15} /></span>
             </article>
           ))
         )}
@@ -763,6 +948,329 @@ function OfferCard({
         </button>
       </div>
     </article>
+  );
+}
+
+function JobDetailSheet({
+  session,
+  orderId,
+  onClose,
+  onChanged,
+}: {
+  session: PartnerSession;
+  orderId: string;
+  onClose: () => void;
+  onChanged: () => void;
+}) {
+  const [job, setJob] = useState<TechnicianJob | null>(null);
+  const [photos, setPhotos] = useState<OrderPhoto[]>([]);
+  const [quotes, setQuotes] = useState<ExtraQuote[]>([]);
+  const [addons, setAddons] = useState<ServiceAddon[]>([]);
+  const [materials, setMaterials] = useState<Material[]>([]);
+  const [message, setMessage] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [selectedAddonId, setSelectedAddonId] = useState('');
+  const [selectedMaterialId, setSelectedMaterialId] = useState('');
+  const [quantity, setQuantity] = useState('1');
+  const [customName, setCustomName] = useState('');
+  const [customPrice, setCustomPrice] = useState('');
+  const [quoteMemo, setQuoteMemo] = useState('');
+  const [quoteLines, setQuoteLines] = useState<Array<{
+    name: string;
+    quantity: number;
+    unit: string;
+    unitPrice: number;
+    addonId?: string;
+    materialId?: string;
+  }>>([]);
+  const readOnly = isReadOnlySession(session);
+
+  const load = useCallback(async () => {
+    setMessage(null);
+    try {
+      const [j, p, q, a, m] = await Promise.all([
+        partnerApi<TechnicianJob>(session, `/technician/jobs/${orderId}`),
+        partnerApi<OrderPhoto[]>(session, `/technician/jobs/${orderId}/photos`),
+        partnerApi<ExtraQuote[]>(session, `/technician/jobs/${orderId}/extra-quotes`),
+        publicApi<ServiceAddon[]>('/service-addons'),
+        partnerApi<Material[]>(session, '/technician/materials'),
+      ]);
+      setJob(j);
+      setPhotos(p);
+      setQuotes(q);
+      setAddons(a.filter((x) => x.customerPrice != null));
+      setMaterials(m);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : '작업 상세를 불러오지 못했습니다.');
+    }
+  }, [orderId, session]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const photoKinds = new Set(photos.map((p) => p.kind));
+  const canComplete = job?.orderStatus === 'working' && photoKinds.has('before_work') && photoKinds.has('after_work');
+  const quoteTotal = quoteLines.reduce((sum, line) => sum + line.quantity * line.unitPrice, 0);
+
+  async function runAction(action: 'depart' | 'start' | 'complete') {
+    if (readOnly) {
+      setMessage('관리자 미리보기에서는 작업 상태를 변경하지 않습니다.');
+      return;
+    }
+    setBusy(true);
+    setMessage(null);
+    try {
+      await partnerApi(session, `/technician/jobs/${orderId}/${action}`, { method: 'PATCH' });
+      await load();
+      await onChanged();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : '처리하지 못했습니다.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function uploadPhoto(kind: OrderPhoto['kind'], file?: File) {
+    if (readOnly) {
+      setMessage('관리자 미리보기에서는 사진을 등록하지 않습니다.');
+      return;
+    }
+    setBusy(true);
+    setMessage(null);
+    try {
+      let uploadFile = file;
+      if (!uploadFile && Capacitor.isNativePlatform()) {
+        const photo = await Camera.getPhoto({
+          quality: 72,
+          resultType: CameraResultType.Uri,
+          source: CameraSource.Camera,
+        });
+        if (!photo.webPath) throw new Error('사진 파일을 읽지 못했습니다.');
+        const blob = await fetch(photo.webPath).then((res) => res.blob());
+        uploadFile = new File([blob], `${kind}-${Date.now()}.${photo.format || 'jpg'}`, {
+          type: blob.type || 'image/jpeg',
+        });
+      }
+      if (!uploadFile) throw new Error('사진 파일을 선택해 주세요.');
+      const form = new FormData();
+      form.set('kind', kind);
+      form.set('caption', kind === 'before_work' ? '작업 전' : kind === 'after_work' ? '작업 후' : '현장 사진');
+      form.set('file', uploadFile);
+      await partnerFormApi<OrderPhoto>(session, `/technician/jobs/${orderId}/photos/upload`, form);
+      await load();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : '사진 업로드에 실패했습니다.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function addAddonLine() {
+    const addon = addons.find((x) => x.id === selectedAddonId);
+    const qty = Math.max(0.001, Number(quantity) || 1);
+    if (!addon || addon.customerPrice == null) return;
+    setQuoteLines((lines) => [
+      ...lines,
+      { name: addon.name, quantity: qty, unit: addon.unit || 'each', unitPrice: addon.customerPrice ?? 0, addonId: addon.id },
+    ]);
+  }
+
+  function addMaterialLine() {
+    const material = materials.find((x) => x.id === selectedMaterialId);
+    const qty = Math.max(0.001, Number(quantity) || 1);
+    if (!material || material.customerPrice == null) return;
+    setQuoteLines((lines) => [
+      ...lines,
+      { name: material.name, quantity: qty, unit: material.unit || 'each', unitPrice: material.customerPrice ?? 0, materialId: material.id },
+    ]);
+  }
+
+  function addCustomLine() {
+    const name = customName.trim();
+    const price = Math.max(0, Math.round(Number(customPrice) || 0));
+    if (!name || price <= 0) return;
+    setQuoteLines((lines) => [...lines, { name, quantity: 1, unit: 'job', unitPrice: price }]);
+    setCustomName('');
+    setCustomPrice('');
+  }
+
+  async function sendQuote() {
+    if (readOnly) {
+      setMessage('관리자 미리보기에서는 최종 명세서를 발송하지 않습니다.');
+      return;
+    }
+    if (quoteLines.length === 0) {
+      setMessage('추가금 항목을 1개 이상 추가해 주세요.');
+      return;
+    }
+    setBusy(true);
+    setMessage(null);
+    try {
+      await partnerApi(session, `/technician/jobs/${orderId}/extra-quotes`, {
+        method: 'POST',
+        body: JSON.stringify({ memo: quoteMemo, items: quoteLines }),
+      });
+      setQuoteLines([]);
+      setQuoteMemo('');
+      await load();
+      await onChanged();
+      setMessage('고객에게 최종 명세서를 보냈습니다.');
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : '명세서를 보내지 못했습니다.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="sheet-backdrop" role="dialog" aria-modal="true">
+      <section className="job-sheet">
+        <header className="sheet-header">
+          <div>
+            <p className="eyebrow">작업 상세</p>
+            <h2>{job?.productName ?? '작업 불러오는 중'}</h2>
+          </div>
+          <button type="button" className="icon-button" onClick={onClose} aria-label="닫기">
+            <XCircle size={20} />
+          </button>
+        </header>
+
+        {message ? <NoticeTone tone={message.includes('실패') || message.includes('못') ? 'danger' : 'info'}>{message}</NoticeTone> : null}
+
+        {job ? (
+          <div className="stack">
+            <section className="job-summary">
+              <div>
+                <span className="badge">{statusLabel(job.orderStatus)}</span>
+                <h3>{job.orderNo}</h3>
+                <p>{job.addressSummary}</p>
+              </div>
+              <div>
+                <strong>{job.customerName}</strong>
+                <span>{job.customerPhone}</span>
+              </div>
+            </section>
+
+            <section className="amount-breakdown">
+              <div><span>기본 설치·청소 금액</span><strong>{won(job.productTotalPrice || job.basePrice)}</strong></div>
+              <div><span>추가금 반영액</span><strong>{won(job.extraTotalPrice)}</strong></div>
+              <div><span>현재 주문 합계</span><strong>{won(job.totalPrice)}</strong></div>
+            </section>
+
+            <div className="button-row">
+              <button className="secondary-button" type="button" disabled={busy || readOnly || job.orderStatus !== 'accepted'} onClick={() => runAction('depart')}>출발</button>
+              <button className="secondary-button" type="button" disabled={busy || readOnly || !['accepted', 'on_the_way'].includes(job.orderStatus)} onClick={() => runAction('start')}>작업 시작</button>
+              <button className="primary-button" type="button" disabled={busy || readOnly || !canComplete} onClick={() => runAction('complete')}>
+                {canComplete ? '완료 요청' : '전/후 사진 필요'}
+              </button>
+            </div>
+
+            <SectionTitle title="작업 사진" />
+            <div className="photo-actions">
+              <PhotoUploadButton label="작업 전 사진" kind="before_work" onUpload={uploadPhoto} disabled={busy || readOnly} />
+              <PhotoUploadButton label="작업 후 사진" kind="after_work" onUpload={uploadPhoto} disabled={busy || readOnly} />
+            </div>
+            <div className="photo-grid">
+              {photos.map((photo) => (
+                <figure key={photo.id}>
+                  <img src={photo.url} alt={photo.caption ?? photo.kind} />
+                  <figcaption>{photo.kind === 'before_work' ? '작업 전' : photo.kind === 'after_work' ? '작업 후' : '기타'}</figcaption>
+                </figure>
+              ))}
+            </div>
+
+            <SectionTitle title="최종 명세서 작성" />
+            <div className="quote-builder">
+              <div className="quote-line-controls">
+                <select value={selectedAddonId} onChange={(e) => setSelectedAddonId(e.target.value)}>
+                  <option value="">추가비 항목 선택</option>
+                  {addons.map((addon) => <option key={addon.id} value={addon.id}>{addon.name} · {won(addon.customerPrice)}</option>)}
+                </select>
+                <select value={selectedMaterialId} onChange={(e) => setSelectedMaterialId(e.target.value)}>
+                  <option value="">자재 선택</option>
+                  {materials.map((m) => <option key={m.id} value={m.id}>{m.name} · {won(m.customerPrice)}</option>)}
+                </select>
+                <input value={quantity} onChange={(e) => setQuantity(e.target.value)} inputMode="decimal" placeholder="수량" />
+                <button type="button" className="secondary-button" onClick={addAddonLine}>추가비 담기</button>
+                <button type="button" className="secondary-button" onClick={addMaterialLine}>자재 담기</button>
+              </div>
+              <div className="quote-line-controls">
+                <input value={customName} onChange={(e) => setCustomName(e.target.value)} placeholder="기타비 항목명" />
+                <input value={customPrice} onChange={(e) => setCustomPrice(e.target.value)} inputMode="numeric" placeholder="금액" />
+                <button type="button" className="secondary-button" onClick={addCustomLine}>기타비 담기</button>
+              </div>
+              <textarea value={quoteMemo} onChange={(e) => setQuoteMemo(e.target.value)} placeholder="고객에게 보낼 현장 설명" />
+              <div className="quote-lines">
+                {quoteLines.map((line, index) => (
+                  <div key={`${line.name}-${index}`}>
+                    <span>{line.name} × {line.quantity} {line.unit}</span>
+                    <strong>{won(line.quantity * line.unitPrice)}</strong>
+                    <button type="button" onClick={() => setQuoteLines((lines) => lines.filter((_, i) => i !== index))}>삭제</button>
+                  </div>
+                ))}
+                <div className="quote-total"><span>명세서 합계</span><strong>{won(quoteTotal)}</strong></div>
+              </div>
+              <button type="button" className="primary-button" disabled={busy || readOnly || quoteLines.length === 0} onClick={sendQuote}>
+                <FileText size={17} /> 최종 명세서 보내기
+              </button>
+            </div>
+
+            <SectionTitle title="명세서·결제 상태" />
+            <div className="stack small">
+              {quotes.length === 0 ? <EmptyState title="보낸 명세서가 없습니다" body="현장 추가금이 있을 때만 고객에게 발송하세요." /> : null}
+              {quotes.map((quote) => (
+                <article className="list-card vertical" key={quote.id}>
+                  <div className="list-card-head">
+                    <strong>{won(quote.totalAmount)}</strong>
+                    <span className="badge">{statusLabel(quote.status)}</span>
+                  </div>
+                  <ul className="mini-list">
+                    {quote.items.map((item) => <li key={item.id}>{item.name} × {item.quantity} · {won(item.amount)}</li>)}
+                  </ul>
+                  {quote.status === 'requested' ? <p className="muted">고객 승인과 결제 확인 대기 중입니다.</p> : null}
+                  {quote.status === 'paid' ? <p className="muted"><CreditCard size={14} /> 추가금 결제 확인 완료</p> : null}
+                </article>
+              ))}
+            </div>
+          </div>
+        ) : null}
+      </section>
+    </div>
+  );
+}
+
+function PhotoUploadButton({
+  label,
+  kind,
+  disabled,
+  onUpload,
+}: {
+  label: string;
+  kind: OrderPhoto['kind'];
+  disabled: boolean;
+  onUpload: (kind: OrderPhoto['kind'], file?: File) => void;
+}) {
+  const inputId = `photo-${kind}`;
+  return (
+    <div className="photo-upload-button">
+      <button type="button" className="secondary-button" disabled={disabled} onClick={() => onUpload(kind)}>
+        <CameraIcon size={17} /> {label}
+      </button>
+      <label htmlFor={inputId} className={disabled ? 'disabled' : ''}>파일 선택</label>
+      <input
+        id={inputId}
+        type="file"
+        accept="image/*"
+        capture="environment"
+        disabled={disabled}
+        onChange={(e) => {
+          const file = e.currentTarget.files?.[0];
+          if (file) onUpload(kind, file);
+          e.currentTarget.value = '';
+        }}
+      />
+    </div>
   );
 }
 
